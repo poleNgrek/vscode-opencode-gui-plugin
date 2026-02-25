@@ -8,8 +8,13 @@
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["AI", "Other"],
-  "activationEvents": ["onStartupFinished"],
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "viewsContainers": {
@@ -17,7 +22,7 @@
         {
           "id": "opencode",
           "title": "OpenCode",
-          "icon": "media/icon.png"
+          "icon": "media/icon.svg"
         }
       ]
     },
@@ -57,12 +62,30 @@
         "opencode.cliPath": {
           "type": "string",
           "default": "opencode",
-          "description": "Path to the opencode CLI binary"
+          "description": "Path to the opencode CLI binary."
+        },
+        "opencode.serverUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Explicit opencode server URL (e.g. http://localhost:4096). If set, the plugin will connect directly without probing or spawning."
+        },
+        "opencode.port": {
+          "type": "number",
+          "default": 4096,
+          "description": "Port to use when probing for or spawning the opencode server."
+        },
+        "opencode.probePorts": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "default": [],
+          "description": "Extra ports to probe when looking for a running opencode server (e.g. [63127, 4097])."
         },
         "opencode.model": {
           "type": "string",
           "default": "",
-          "description": "Model to use (leave empty for opencode default)"
+          "description": "Model override passed to opencode (e.g. anthropic/claude-sonnet-4-5)."
         }
       }
     }
@@ -78,5 +101,8 @@
     "@types/vscode": "^1.85.0",
     "typescript": "^5.3.0",
     "@vscode/vsce": "^2.22.0"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.2.11"
   }
 }
