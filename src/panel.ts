@@ -142,6 +142,10 @@ export class OpenCodePanel implements vscode.WebviewViewProvider, vscode.Disposa
             }
 
             let fullContent = "";
+            let echoStripped = false;
+            // The opencode server sometimes echoes the prompt text at the start of
+            // the assistant reply. Strip it so the UI only shows the answer.
+            const promptPrefix = text.trim();
 
             await this.client.send(
                 this.remoteSessionId,
@@ -149,6 +153,28 @@ export class OpenCodePanel implements vscode.WebviewViewProvider, vscode.Disposa
                 this.session.contextFiles,
                 (chunk) => {
                     fullContent += chunk;
+
+                    // On the very first chunk(s), check whether the accumulated
+                    // text starts with the echoed prompt and discard that prefix.
+                    if (!echoStripped) {
+                        if (fullContent.trimStart().startsWith(promptPrefix)) {
+                            // Wait until we have at least the full prefix
+                            const afterPrefix = fullContent.trimStart().slice(promptPrefix.length).replace(/^\s*\n?/, "");
+                            // Only start emitting once we've consumed the echo
+                            echoStripped = true;
+                            fullContent = afterPrefix;
+                            if (afterPrefix) {
+                                this.post({ type: "streamChunk", id: assistantId, chunk: afterPrefix });
+                            }
+                        } else if (fullContent.length >= promptPrefix.length) {
+                            // No echo present — flush everything buffered so far
+                            echoStripped = true;
+                            this.post({ type: "streamChunk", id: assistantId, chunk: fullContent });
+                        }
+                        // Still accumulating — don't emit yet
+                        return;
+                    }
+
                     this.post({ type: "streamChunk", id: assistantId, chunk });
                 },
                 () => {

@@ -21,19 +21,25 @@ export interface Session {
 // Minimal shape of the SDK client we rely on
 interface SDKClient {
     session: {
-        create(opts: { body: Record<string, unknown> }): Promise<{ data?: { id?: string }; id?: string }>;
+        create(opts: { body?: Record<string, unknown> }): Promise<{ data?: { id?: string } }>;
         prompt(opts: {
             path: { id: string };
-            body: { parts: Array<{ type: string; text: string }> };
+            body: {
+                parts: Array<{ type: string; text: string }>;
+                model?: { providerID: string; modelID: string };
+            };
         }): Promise<unknown>;
         abort(opts: { path: { id: string } }): Promise<unknown>;
     };
     event: {
         subscribe(opts?: { signal?: AbortSignal }): Promise<{
-            stream: AsyncIterable<{
+            stream: AsyncGenerator<{
+                // Real SDK event union — we only care about message.part.updated
                 type?: string;
-                sessionID?: string;
-                part?: { type?: string; text?: string };
+                properties?: {
+                    part?: { type?: string; text?: string; sessionID?: string };
+                    delta?: string;
+                };
             }>;
         }>;
     };
@@ -139,7 +145,7 @@ export class OpenCodeClient implements vscode.Disposable {
     async createSession(): Promise<string> {
         const client = await this.getClient();
         const result = await client.session.create({ body: {} });
-        const id = result?.data?.id ?? (result as { id?: string })?.id;
+        const id = result?.data?.id;
         if (!id) throw new Error("opencode server did not return a session ID.");
         return id;
     }
@@ -186,11 +192,27 @@ export class OpenCodeClient implements vscode.Disposable {
 
         parts.push({ type: "text", text: prompt });
 
+        // Resolve model from settings (format: "providerID/modelID")
+        const config = vscode.workspace.getConfiguration("opencode");
+        const modelSetting = config.get<string>("model") || "";
+        let modelOpt: { providerID: string; modelID: string } | undefined;
+        if (modelSetting) {
+            const slash = modelSetting.indexOf("/");
+            if (slash > 0) {
+                modelOpt = {
+                    providerID: modelSetting.slice(0, slash),
+                    modelID: modelSetting.slice(slash + 1),
+                };
+            }
+        }
+
         // Subscribe to the event stream BEFORE sending the prompt
-        let eventStream: AsyncIterable<{
+        let eventStream: AsyncGenerator<{
             type?: string;
-            sessionID?: string;
-            part?: { type?: string; text?: string };
+            properties?: {
+                part?: { type?: string; text?: string; sessionID?: string };
+                delta?: string;
+            };
         }> | null = null;
 
         try {
@@ -206,13 +228,17 @@ export class OpenCodeClient implements vscode.Disposable {
                 try {
                     for await (const event of eventStream!) {
                         if (abort.signal.aborted) break;
+                        // The SDK emits events shaped as:
+                        //   { type: "message.part.updated", properties: { part: { sessionID, type, text }, delta } }
+                        // `delta` is the incremental text chunk for streaming text parts.
                         if (
-                            event?.sessionID === sessionId &&
-                            event?.type === "text" &&
-                            event?.part?.type === "text" &&
-                            typeof event?.part?.text === "string"
+                            event?.type === "message.part.updated" &&
+                            event?.properties?.part?.sessionID === sessionId &&
+                            event?.properties?.part?.type === "text"
                         ) {
-                            onChunk(event.part.text);
+                            // Prefer delta (incremental chunk) over full text to avoid duplication
+                            const chunk = event.properties.delta ?? event.properties.part.text ?? "";
+                            if (chunk) onChunk(chunk);
                         }
                     }
                 } catch {
@@ -225,7 +251,7 @@ export class OpenCodeClient implements vscode.Disposable {
         try {
             await client.session.prompt({
                 path: { id: sessionId },
-                body: { parts },
+                body: { parts, ...(modelOpt ? { model: modelOpt } : {}) },
             });
         } catch (err) {
             if (!abort.signal.aborted) {
