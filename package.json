@@ -1,6 +1,7 @@
 {
   "name": "vscode-opencode-gui-plugin",
-  "publisher": "Ben",
+  "publisher": "poleNgrek",
+  "repository": "https://github.com/poleNgrek/vscode-opencode-gui-plugin",
   "displayName": "OpenCode Sidebar UI",
   "description": "AI coding assistant powered by opencode CLI",
   "version": "0.1.0",
