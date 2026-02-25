@@ -1,0 +1,7 @@
+.vscode/**
+.vscode-test/**
+src/**
+.gitignore
+tsconfig.json
+**/*.map
+# Note: node_modules is intentionally NOT ignored so @opencode-ai/sdk gets bundled
