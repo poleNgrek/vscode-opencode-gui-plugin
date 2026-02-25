@@ -3,5 +3,7 @@
 src/**
 .gitignore
 tsconfig.json
+esbuild.js
 **/*.map
-# Note: node_modules is intentionally NOT ignored so @opencode-ai/sdk gets bundled
+node_modules/**
+out/**
