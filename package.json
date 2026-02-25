@@ -1,0 +1,81 @@
+{
+  "name": "vscode-opencode-gui-plugin",
+  "publisher": "Ben",
+  "displayName": "OpenCode Sidebar UI",
+  "description": "AI coding assistant powered by opencode CLI",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["AI", "Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "opencode",
+          "title": "OpenCode",
+          "icon": "media/icon.png"
+        }
+      ]
+    },
+    "views": {
+      "opencode": [
+        {
+          "type": "webview",
+          "id": "opencode.chatView",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "opencode.newSession",
+        "title": "OpenCode: New Session"
+      },
+      {
+        "command": "opencode.addCurrentFile",
+        "title": "OpenCode: Add Current File to Context"
+      },
+      {
+        "command": "opencode.focus",
+        "title": "OpenCode: Focus Chat"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "opencode.focus",
+        "key": "ctrl+shift+o",
+        "mac": "cmd+shift+o"
+      }
+    ],
+    "configuration": {
+      "title": "OpenCode",
+      "properties": {
+        "opencode.cliPath": {
+          "type": "string",
+          "default": "opencode",
+          "description": "Path to the opencode CLI binary"
+        },
+        "opencode.model": {
+          "type": "string",
+          "default": "",
+          "description": "Model to use (leave empty for opencode default)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0",
+    "@vscode/vsce": "^2.22.0"
+  }
+}
