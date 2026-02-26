@@ -1,34 +1,37 @@
 import * as vscode from "vscode";
-import { OpenCodeClient, Session, Message } from "./opencode";
+import { OpenCodeClient, RemoteSession } from "./opencode";
 
 type WebviewMessage =
+    | { type: "ready" }
     | { type: "send"; text: string }
-    | { type: "newSession" }
     | { type: "abort" }
+    | { type: "newSession" }
+    | { type: "switchSession"; id: string }
+    | { type: "deleteSession"; id: string }
     | { type: "removeFile"; filePath: string }
-    | { type: "pickFiles" }
-    | { type: "ready" };
+    | { type: "pickFiles" };
 
 export class OpenCodePanel implements vscode.WebviewViewProvider, vscode.Disposable {
     private view?: vscode.WebviewView;
     private client: OpenCodeClient;
 
-    // Local session state (UI layer)
-    private session: Session;
-    // The opencode server session ID (set after first createSession call)
+    // The opencode server session ID currently active in the chat
     private remoteSessionId: string | null = null;
+    // File context is stored here (not in a local Session object)
+    private contextFiles: string[] = [];
     private isStreaming = false;
 
     constructor(private readonly context: vscode.ExtensionContext) {
         this.client = new OpenCodeClient();
-        this.session = this.makeLocalSession();
+        // Whenever the background watcher sees a session change, push a fresh list
+        this.client.onSessionsChanged = () => {
+            this.pushSessionList().catch(() => {});
+        };
     }
 
-    private makeLocalSession(): Session {
-        return { id: Date.now().toString(), messages: [], contextFiles: [] };
-    }
+    // ── WebviewViewProvider ───────────────────────────────────────────────────
 
-    resolveWebviewView(webviewView: vscode.WebviewView) {
+    resolveWebviewView(webviewView: vscode.WebviewView): void {
         this.view = webviewView;
 
         webviewView.webview.options = {
@@ -41,22 +44,22 @@ export class OpenCodePanel implements vscode.WebviewViewProvider, vscode.Disposa
         webviewView.webview.onDidReceiveMessage((msg: WebviewMessage) => {
             switch (msg.type) {
                 case "ready":
-                    this.syncState();
+                    this.onReady();
                     break;
                 case "send":
                     this.handleSend(msg.text);
                     break;
+                case "abort":
+                    this.handleAbort();
+                    break;
                 case "newSession":
                     this.newSession();
                     break;
-                case "abort":
-                    if (this.remoteSessionId) {
-                        this.client.abortSession(this.remoteSessionId).catch(() => {});
-                    } else {
-                        this.client.abort();
-                    }
-                    this.isStreaming = false;
-                    this.post({ type: "streamEnd" });
+                case "switchSession":
+                    this.switchSession(msg.id);
+                    break;
+                case "deleteSession":
+                    this.deleteSession(msg.id);
                     break;
                 case "removeFile":
                     this.removeFileContext(msg.filePath);
@@ -68,42 +71,105 @@ export class OpenCodePanel implements vscode.WebviewViewProvider, vscode.Disposa
         });
     }
 
-    private post(msg: unknown) {
+    private post(msg: unknown): void {
         this.view?.webview.postMessage(msg);
     }
 
-    private syncState() {
-        this.post({
-            type: "restore",
-            session: this.session,
-            isStreaming: this.isStreaming,
-        });
+    // ── Initialisation ────────────────────────────────────────────────────────
+
+    private async onReady(): Promise<void> {
+        // Restore file context chips if webview was hidden and re-shown
+        this.post({ type: "updateFiles", files: this.contextFiles });
+
+        // Load sessions from server (also triggers server connection)
+        await this.pushSessionList();
+
+        // Start background SSE watcher for live session list updates
+        this.client.startBackgroundWatch().catch(() => {});
+
+        // If there was an active session, reload its messages
+        if (this.remoteSessionId) {
+            await this.loadAndShowMessages(this.remoteSessionId);
+        }
     }
 
-    newSession() {
-        this.client.abort();
-        this.isStreaming = false;
-        this.remoteSessionId = null;
-        this.session = this.makeLocalSession();
-        this.post({ type: "newSession" });
+    // ── Session list ──────────────────────────────────────────────────────────
+
+    private async pushSessionList(): Promise<void> {
+        try {
+            this.post({ type: "status", text: "Loading sessions…" });
+            const sessions = await this.client.listSessions();
+            this.post({ type: "sessionList", sessions, activeId: this.remoteSessionId });
+            this.post({ type: "status", text: "" });
+        } catch (err) {
+            this.post({ type: "status", text: "" });
+            this.post({ type: "error", message: `Could not reach opencode server: ${err}` });
+        }
     }
 
-    addFileContext(filePath: string) {
-        if (!this.session.contextFiles.includes(filePath)) {
-            this.session.contextFiles.push(filePath);
-            this.post({ type: "updateFiles", files: this.session.contextFiles });
+    private async loadAndShowMessages(sessionId: string): Promise<void> {
+        try {
+            const messages = await this.client.loadMessages(sessionId);
+            this.post({ type: "loadMessages", messages });
+        } catch (err) {
+            this.post({ type: "error", message: `Could not load messages: ${err}` });
+        }
+    }
+
+    // ── Session management ────────────────────────────────────────────────────
+
+    async newSession(): Promise<void> {
+        this.handleAbort();
+        try {
+            this.post({ type: "status", text: "Creating session…" });
+            const session: RemoteSession = await this.client.createSession();
+            this.remoteSessionId = session.id;
+            this.post({ type: "status", text: "" });
+            this.post({ type: "newSession" }); // clears chat UI
+            // Refresh list so the new session appears immediately
+            await this.pushSessionList();
+        } catch (err) {
+            this.post({ type: "status", text: "" });
+            this.post({ type: "error", message: String(err) });
+        }
+    }
+
+    private async switchSession(id: string): Promise<void> {
+        this.handleAbort();
+        this.remoteSessionId = id;
+        this.post({ type: "switchSession", id });
+        await this.loadAndShowMessages(id);
+    }
+
+    private async deleteSession(id: string): Promise<void> {
+        try {
+            await this.client.deleteSession(id);
+            if (this.remoteSessionId === id) {
+                this.remoteSessionId = null;
+                this.post({ type: "newSession" }); // clear chat
+            }
+            await this.pushSessionList();
+        } catch (err) {
+            this.post({ type: "error", message: `Delete failed: ${err}` });
+        }
+    }
+
+    // ── File context ──────────────────────────────────────────────────────────
+
+    addFileContext(filePath: string): void {
+        if (!this.contextFiles.includes(filePath)) {
+            this.contextFiles.push(filePath);
+            this.post({ type: "updateFiles", files: this.contextFiles });
         }
         vscode.commands.executeCommand("opencode.chatView.focus");
     }
 
-    private removeFileContext(filePath: string) {
-        this.session.contextFiles = this.session.contextFiles.filter(
-            (f) => f !== filePath
-        );
-        this.post({ type: "updateFiles", files: this.session.contextFiles });
+    private removeFileContext(filePath: string): void {
+        this.contextFiles = this.contextFiles.filter((f) => f !== filePath);
+        this.post({ type: "updateFiles", files: this.contextFiles });
     }
 
-    private async pickFiles() {
+    private async pickFiles(): Promise<void> {
         const uris = await vscode.window.showOpenDialog({
             canSelectMany: true,
             openLabel: "Add to context",
@@ -116,94 +182,73 @@ export class OpenCodePanel implements vscode.WebviewViewProvider, vscode.Disposa
         }
     }
 
-    private async handleSend(text: string) {
+    // ── Abort ─────────────────────────────────────────────────────────────────
+
+    private handleAbort(): void {
+        if (this.remoteSessionId) {
+            this.client.abortSession(this.remoteSessionId).catch(() => {});
+        } else {
+            this.client.abort();
+        }
+        this.isStreaming = false;
+        this.post({ type: "streamEnd" });
+    }
+
+    // ── Send + stream ─────────────────────────────────────────────────────────
+
+    private async handleSend(text: string): Promise<void> {
         if (this.isStreaming || !text.trim()) return;
 
-        // Show user message immediately
-        const userMsg: Message = {
-            id: Date.now().toString(),
-            role: "user",
-            content: text,
-            timestamp: Date.now(),
-        };
-        this.session.messages.push(userMsg);
-        this.post({ type: "userMessage", message: userMsg });
+        // Eagerly create a session if none exists yet
+        if (!this.remoteSessionId) {
+            try {
+                this.post({ type: "status", text: "Connecting to opencode server…" });
+                const session: RemoteSession = await this.client.createSession();
+                this.remoteSessionId = session.id;
+                this.post({ type: "status", text: "" });
+                await this.pushSessionList();
+            } catch (err) {
+                this.post({ type: "status", text: "" });
+                this.post({ type: "error", message: String(err) });
+                return;
+            }
+        }
+
+        // Show user bubble immediately (optimistic)
+        this.post({ type: "userMessage", text, timestamp: Date.now() });
 
         this.isStreaming = true;
-        const assistantId = (Date.now() + 1).toString();
+        const assistantId = String(Date.now() + 1);
         this.post({ type: "streamStart", id: assistantId });
 
-        try {
-            // Lazily create a remote session on first message
-            if (!this.remoteSessionId) {
-                this.post({ type: "status", text: "Connecting to opencode server…" });
-                this.remoteSessionId = await this.client.createSession();
-                this.post({ type: "status", text: "" });
+        await this.client.send(
+            this.remoteSessionId,
+            text,
+            this.contextFiles,
+            (chunk) => {
+                this.post({ type: "streamChunk", id: assistantId, chunk });
+            },
+            () => {
+                this.isStreaming = false;
+                this.post({ type: "streamEnd", id: assistantId });
+                // Server may have auto-updated the session title — refresh list
+                this.pushSessionList().catch(() => {});
+            },
+            (err) => {
+                this.isStreaming = false;
+                this.post({ type: "error", message: err });
+                this.post({ type: "streamEnd", id: assistantId });
             }
-
-            let fullContent = "";
-            let echoStripped = false;
-            // The opencode server sometimes echoes the prompt text at the start of
-            // the assistant reply. Strip it so the UI only shows the answer.
-            const promptPrefix = text.trim();
-
-            await this.client.send(
-                this.remoteSessionId,
-                text,
-                this.session.contextFiles,
-                (chunk) => {
-                    fullContent += chunk;
-
-                    // On the very first chunk(s), check whether the accumulated
-                    // text starts with the echoed prompt and discard that prefix.
-                    if (!echoStripped) {
-                        if (fullContent.trimStart().startsWith(promptPrefix)) {
-                            // Wait until we have at least the full prefix
-                            const afterPrefix = fullContent.trimStart().slice(promptPrefix.length).replace(/^\s*\n?/, "");
-                            // Only start emitting once we've consumed the echo
-                            echoStripped = true;
-                            fullContent = afterPrefix;
-                            if (afterPrefix) {
-                                this.post({ type: "streamChunk", id: assistantId, chunk: afterPrefix });
-                            }
-                        } else if (fullContent.length >= promptPrefix.length) {
-                            // No echo present — flush everything buffered so far
-                            echoStripped = true;
-                            this.post({ type: "streamChunk", id: assistantId, chunk: fullContent });
-                        }
-                        // Still accumulating — don't emit yet
-                        return;
-                    }
-
-                    this.post({ type: "streamChunk", id: assistantId, chunk });
-                },
-                () => {
-                    this.isStreaming = false;
-                    const assistantMsg: Message = {
-                        id: assistantId,
-                        role: "assistant",
-                        content: fullContent,
-                        timestamp: Date.now(),
-                    };
-                    this.session.messages.push(assistantMsg);
-                    this.post({ type: "streamEnd", id: assistantId });
-                },
-                (err) => {
-                    this.isStreaming = false;
-                    this.post({ type: "error", message: err });
-                    this.post({ type: "streamEnd", id: assistantId });
-                }
-            );
-        } catch (err) {
-            this.isStreaming = false;
-            this.post({ type: "error", message: String(err) });
-            this.post({ type: "streamEnd", id: assistantId });
-        }
+        );
     }
 
-    dispose() {
+    // ── Dispose ───────────────────────────────────────────────────────────────
+
+    dispose(): void {
         this.client.dispose();
     }
+
+    // ── HTML ──────────────────────────────────────────────────────────────────
 
     private getHtml(webview: vscode.Webview): string {
         const scriptUri = webview.asWebviewUri(
@@ -240,180 +285,189 @@ export class OpenCodePanel implements vscode.WebviewViewProvider, vscode.Disposa
     }
 
     html, body { height: 100%; background: var(--bg); color: var(--fg); font-family: var(--vscode-font-family, system-ui); font-size: 13px; line-height: 1.6; }
-
     #app { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 
-    /* Header */
+    /* ── Header ── */
     #header {
       display: flex; align-items: center; justify-content: space-between;
-      padding: 10px 14px 8px; border-bottom: 1px solid var(--border);
+      padding: 8px 12px; border-bottom: 1px solid var(--border);
       background: var(--bg); flex-shrink: 0;
     }
-    #header-left { display: flex; align-items: center; gap: 8px; }
+    #header-left { display: flex; align-items: center; gap: 7px; }
     #header-title { font-size: 11px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--accent-hi); }
-    #status-dot {
-      width: 7px; height: 7px; border-radius: 50%;
-      background: #22c55e; flex-shrink: 0; display: none;
-    }
+    #status-dot { width: 7px; height: 7px; border-radius: 50%; display: none; flex-shrink: 0; }
     #status-dot.connecting { background: #f59e0b; display: block; animation: pulse 1s ease-in-out infinite; }
     #status-dot.connected  { background: #22c55e; display: block; }
     #status-dot.error      { background: #ef4444; display: block; }
-    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.3; } }
-
+    @keyframes pulse { 0%,100%{opacity:1}50%{opacity:.3} }
     #btn-new {
       background: none; border: 1px solid var(--border); color: var(--fg-muted);
       border-radius: 6px; padding: 3px 8px; font-size: 11px; cursor: pointer;
-      display: flex; align-items: center; gap: 5px; transition: all .15s;
+      display: flex; align-items: center; gap: 4px; transition: all .15s;
     }
     #btn-new:hover { border-color: var(--accent); color: var(--accent-hi); }
 
-    /* Status bar */
-    #status-bar {
-      font-size: 11px; color: var(--fg-muted); padding: 4px 14px;
-      background: var(--bg); border-bottom: 1px solid var(--border);
-      display: none; flex-shrink: 0;
-    }
+    /* ── Status bar ── */
+    #status-bar { font-size: 11px; color: var(--fg-muted); padding: 3px 12px; background: var(--bg); border-bottom: 1px solid var(--border); display: none; flex-shrink: 0; }
     #status-bar.visible { display: block; }
 
-    /* Context files */
+    /* ── Session list ── */
+    #session-section { flex-shrink: 0; border-bottom: 1px solid var(--border); }
+    #session-toggle {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 5px 12px; cursor: pointer; user-select: none;
+      background: var(--bg); font-size: 10px; font-weight: 700;
+      letter-spacing: .1em; text-transform: uppercase; color: var(--fg-muted);
+      transition: color .15s;
+    }
+    #session-toggle:hover { color: var(--fg); }
+    #session-toggle-icon { font-size: 9px; transition: transform .2s; }
+    #session-toggle-icon.open { transform: rotate(90deg); }
+    #session-list-wrap { max-height: 180px; overflow-y: auto; display: none; }
+    #session-list-wrap.open { display: block; }
+    #session-list-wrap::-webkit-scrollbar { width: 3px; }
+    #session-list-wrap::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+    .session-item {
+      display: flex; align-items: center; gap: 6px;
+      padding: 5px 12px; cursor: pointer; transition: background .1s;
+      border-left: 2px solid transparent;
+    }
+    .session-item:hover { background: rgba(255,255,255,.04); }
+    .session-item.active { border-left-color: var(--accent); background: rgba(59,130,246,.08); }
+    .session-item-body { flex: 1; min-width: 0; }
+    .session-title { font-size: 12px; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .session-time { font-size: 10px; color: var(--fg-muted); }
+    .session-delete {
+      opacity: 0; background: none; border: none; cursor: pointer;
+      color: var(--fg-muted); padding: 2px 4px; border-radius: 4px;
+      font-size: 13px; line-height: 1; transition: all .1s; flex-shrink: 0;
+    }
+    .session-item:hover .session-delete { opacity: 1; }
+    .session-delete:hover { color: #ef4444; background: rgba(239,68,68,.1); }
+    #session-empty { padding: 10px 12px; font-size: 11px; color: var(--fg-muted); }
+
+    /* ── Context bar ── */
     #context-bar {
-      padding: 6px 10px; border-bottom: 1px solid var(--border);
-      display: flex; flex-wrap: wrap; gap: 5px; align-items: center;
-      flex-shrink: 0; min-height: 36px;
+      padding: 5px 10px; border-bottom: 1px solid var(--border);
+      display: flex; flex-wrap: wrap; gap: 4px; align-items: center;
+      flex-shrink: 0; min-height: 34px;
     }
     #context-bar.empty { display: none; }
     .file-chip {
-      display: flex; align-items: center; gap: 4px;
+      display: flex; align-items: center; gap: 3px;
       background: #1e2433; border: 1px solid #2d3a55;
-      border-radius: 5px; padding: 2px 7px; font-size: 11px;
-      color: #93b4e8; max-width: 180px;
+      border-radius: 4px; padding: 1px 6px; font-size: 11px; color: #93b4e8; max-width: 160px;
     }
     .file-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .file-chip .remove { cursor: pointer; color: #5a6a8a; font-size: 13px; line-height: 1; flex-shrink: 0; transition: color .1s; }
     .file-chip .remove:hover { color: #ef4444; }
-    #btn-pick {
-      background: none; border: 1px dashed var(--border); color: var(--fg-muted);
-      border-radius: 5px; padding: 2px 8px; font-size: 11px; cursor: pointer; transition: all .15s;
-    }
+    #btn-pick { background: none; border: 1px dashed var(--border); color: var(--fg-muted); border-radius: 4px; padding: 1px 7px; font-size: 11px; cursor: pointer; transition: all .15s; }
     #btn-pick:hover { border-color: var(--accent); color: var(--accent); }
 
-    /* Messages */
-    #messages {
-      flex: 1; overflow-y: auto; padding: 14px 10px;
-      display: flex; flex-direction: column; gap: 12px; scroll-behavior: smooth;
-    }
+    /* ── Messages ── */
+    #messages { flex: 1; overflow-y: auto; padding: 12px 10px; display: flex; flex-direction: column; gap: 10px; scroll-behavior: smooth; }
     #messages::-webkit-scrollbar { width: 4px; }
     #messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
-
-    .message { display: flex; flex-direction: column; gap: 4px; animation: fadeUp .2s ease; }
-    @keyframes fadeUp { from { opacity:0; transform: translateY(6px); } to { opacity:1; transform: none; } }
+    .message { display: flex; flex-direction: column; gap: 3px; animation: fadeUp .18s ease; }
+    @keyframes fadeUp { from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none} }
     .message.user { align-items: flex-end; }
     .message.assistant { align-items: flex-start; }
-
-    .bubble {
-      max-width: 90%; padding: 9px 13px; border-radius: var(--radius);
-      font-size: 13px; line-height: 1.65; word-break: break-word; white-space: pre-wrap;
-    }
+    .bubble { max-width: 90%; padding: 8px 12px; border-radius: var(--radius); font-size: 13px; line-height: 1.65; word-break: break-word; white-space: pre-wrap; }
     .user .bubble { background: var(--user-bg); border: 1px solid #2d3a55; border-bottom-right-radius: 3px; color: #c8d8f5; }
     .assistant .bubble { background: var(--ai-bg); border: 1px solid var(--border); border-bottom-left-radius: 3px; color: var(--fg); }
     .assistant .bubble code { font-family: var(--font-mono); font-size: 12px; background: #0d0d0f; padding: 1px 5px; border-radius: 4px; }
-    .assistant .bubble pre { background: #0d0d0f; border: 1px solid var(--border); border-radius: 7px; padding: 10px 12px; overflow-x: auto; margin: 8px 0; font-family: var(--font-mono); font-size: 12px; line-height: 1.5; }
+    .assistant .bubble pre { background: #0d0d0f; border: 1px solid var(--border); border-radius: 7px; padding: 10px 12px; overflow-x: auto; margin: 6px 0; font-family: var(--font-mono); font-size: 12px; line-height: 1.5; }
     .assistant .bubble pre code { background: none; padding: 0; }
-
-    .role-label { font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--fg-muted); padding: 0 3px; }
+    .role-label { font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; padding: 0 3px; }
     .user .role-label { color: #4e6fa0; }
     .assistant .role-label { color: #3b6e3b; }
-
     .streaming-cursor::after { content: '▋'; animation: blink .8s step-end infinite; color: var(--accent); }
-    @keyframes blink { 50% { opacity: 0; } }
-
-    #empty {
-      flex: 1; display: flex; flex-direction: column;
-      align-items: center; justify-content: center;
-      gap: 10px; color: var(--fg-muted); text-align: center; padding: 20px;
-    }
-    #empty svg { opacity: .3; }
-    #empty h3 { font-size: 14px; font-weight: 600; color: var(--fg); opacity: .7; }
+    @keyframes blink { 50%{opacity:0} }
+    #empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: var(--fg-muted); text-align: center; padding: 20px; }
+    #empty svg { opacity: .25; }
+    #empty h3 { font-size: 14px; font-weight: 600; color: var(--fg); opacity: .6; }
     #empty p { font-size: 12px; max-width: 200px; line-height: 1.5; }
+    .error-msg { background: #2d1212; border: 1px solid #5a2020; color: #f87171; border-radius: var(--radius); padding: 8px 12px; font-size: 12px; align-self: stretch; }
 
-    .error-msg {
-      background: #2d1212; border: 1px solid #5a2020; color: #f87171;
-      border-radius: var(--radius); padding: 9px 13px; font-size: 12px; align-self: stretch;
-    }
-
-    /* Input */
-    #input-area { flex-shrink: 0; padding: 10px; border-top: 1px solid var(--border); background: var(--bg); }
-    #input-row {
-      display: flex; gap: 8px; align-items: flex-end;
-      background: var(--input-bg); border: 1px solid var(--border);
-      border-radius: var(--radius); padding: 8px 10px; transition: border-color .2s;
-    }
+    /* ── Input ── */
+    #input-area { flex-shrink: 0; padding: 8px 10px 10px; border-top: 1px solid var(--border); background: var(--bg); }
+    #input-row { display: flex; gap: 7px; align-items: flex-end; background: var(--input-bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 7px 9px; transition: border-color .2s; }
     #input-row:focus-within { border-color: var(--accent); }
-    #input {
-      flex: 1; background: none; border: none; outline: none;
-      color: var(--fg); font-family: inherit; font-size: 13px;
-      resize: none; line-height: 1.5; max-height: 160px; overflow-y: auto; min-height: 22px;
-    }
+    #input { flex: 1; background: none; border: none; outline: none; color: var(--fg); font-family: inherit; font-size: 13px; resize: none; line-height: 1.5; max-height: 140px; overflow-y: auto; min-height: 20px; }
     #input::placeholder { color: var(--fg-muted); }
-    #input-actions { display: flex; gap: 6px; align-items: center; }
-    #btn-context { background: none; border: none; cursor: pointer; color: var(--fg-muted); padding: 2px 4px; border-radius: 5px; font-size: 16px; line-height: 1; transition: color .15s; }
+    #input-actions { display: flex; gap: 5px; align-items: center; }
+    #btn-context { background: none; border: none; cursor: pointer; color: var(--fg-muted); padding: 2px 3px; border-radius: 4px; font-size: 15px; line-height: 1; transition: color .15s; }
     #btn-context:hover { color: var(--accent-hi); }
-    #btn-send, #btn-stop {
-      border: none; border-radius: 7px; cursor: pointer;
-      width: 30px; height: 30px; display: flex; align-items: center;
-      justify-content: center; transition: all .15s; flex-shrink: 0;
-    }
+    #btn-send, #btn-stop { border: none; border-radius: 7px; cursor: pointer; width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; transition: all .15s; flex-shrink: 0; }
     #btn-send { background: var(--accent); color: #fff; }
     #btn-send:hover { background: var(--accent-hi); }
     #btn-send:disabled { opacity: .35; cursor: default; }
     #btn-stop { background: #3d1515; color: #f87171; border: 1px solid #5a2020; display: none; }
     #btn-stop:hover { background: #5a1f1f; }
-    #hint { font-size: 10px; color: var(--fg-muted); text-align: right; padding: 4px 2px 0; }
+    #hint { font-size: 10px; color: var(--fg-muted); text-align: right; padding: 3px 1px 0; }
   </style>
 </head>
 <body>
 <div id="app">
+
+  <!-- Header -->
   <div id="header">
     <div id="header-left">
-      <div id="status-dot" title="Server status"></div>
+      <div id="status-dot"></div>
       <span id="header-title">⬡ OpenCode</span>
     </div>
     <button id="btn-new" title="New session">
-      <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor">
+      <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
         <path d="M8 2a6 6 0 1 0 0 12A6 6 0 0 0 8 2zM7 5h2v2h2v2H9v2H7v-2H5V7h2V5z"/>
       </svg>
       New
     </button>
   </div>
 
+  <!-- Status bar -->
   <div id="status-bar"></div>
 
-  <div id="context-bar" class="empty">
-    <button id="btn-pick" title="Add files to context">+ Add files</button>
-  </div>
-
-  <div id="messages">
-    <div id="empty">
-      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
-        <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
-      </svg>
-      <h3>OpenCode</h3>
-      <p>Ask anything about your code. Add files for context.</p>
+  <!-- Session list -->
+  <div id="session-section">
+    <div id="session-toggle">
+      <span>Sessions</span>
+      <span id="session-toggle-icon">▶</span>
+    </div>
+    <div id="session-list-wrap">
+      <div id="session-list"></div>
+      <div id="session-empty" style="display:none">No sessions yet</div>
     </div>
   </div>
 
+  <!-- Context bar -->
+  <div id="context-bar" class="empty">
+    <button id="btn-pick">+ Add files</button>
+  </div>
+
+  <!-- Messages -->
+  <div id="messages">
+    <div id="empty">
+      <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
+        <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+      </svg>
+      <h3>OpenCode</h3>
+      <p>Select a session or create a new one to start chatting.</p>
+    </div>
+  </div>
+
+  <!-- Input -->
   <div id="input-area">
     <div id="input-row">
       <textarea id="input" placeholder="Ask opencode…" rows="1"></textarea>
       <div id="input-actions">
         <button id="btn-context" title="Add file context">📎</button>
         <button id="btn-send" title="Send (Enter)">
-          <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor">
             <path d="M2 13.5l12-5.5-12-5.5v4l8 1.5-8 1.5v4z"/>
           </svg>
         </button>
-        <button id="btn-stop" title="Stop generation">
-          <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
+        <button id="btn-stop" title="Stop">
+          <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor">
             <rect x="3" y="3" width="10" height="10" rx="1"/>
           </svg>
         </button>
@@ -421,8 +475,8 @@ export class OpenCodePanel implements vscode.WebviewViewProvider, vscode.Disposa
     </div>
     <div id="hint">Enter to send · Shift+Enter for newline</div>
   </div>
-</div>
 
+</div>
 <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;

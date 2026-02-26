@@ -3,7 +3,7 @@ import * as net from "net";
 import * as vscode from "vscode";
 import { createOpencodeClient } from "@opencode-ai/sdk";
 
-// ─── Local types (mirrors @opencode-ai/sdk shapes we actually use) ────────────
+// ─── Public types ─────────────────────────────────────────────────────────────
 
 export interface Message {
     id: string;
@@ -18,10 +18,33 @@ export interface Session {
     contextFiles: string[];
 }
 
-// Minimal shape of the SDK client we rely on
+export interface RemoteSession {
+    id: string;
+    title: string;
+    updatedAt: number; // epoch ms
+}
+
+export interface RemoteMessage {
+    role: "user" | "assistant";
+    text: string;
+    timestamp: number;
+}
+
+// ─── SDK client interface ─────────────────────────────────────────────────────
+// Describes exactly the SDK surface we use, matching the real SDK shapes.
+
 interface SDKClient {
     session: {
-        create(opts: { body?: Record<string, unknown> }): Promise<{ data?: { id?: string } }>;
+        create(opts: { body?: Record<string, unknown> }): Promise<{ data?: { id?: string; title?: string; time?: { updated?: number } } }>;
+        list(): Promise<{ data?: Array<{ id: string; title?: string; time?: { updated?: number } }> }>;
+        messages(opts: { path: { id: string } }): Promise<{
+            data?: Array<{
+                info: { role: string; time?: { created?: number } };
+                parts: Array<{ type: string; text?: string }>;
+            }>;
+        }>;
+        update(opts: { path: { id: string }; body: { title: string } }): Promise<unknown>;
+        delete(opts: { path: { id: string } }): Promise<unknown>;
         prompt(opts: {
             path: { id: string };
             body: {
@@ -31,12 +54,22 @@ interface SDKClient {
         }): Promise<unknown>;
         abort(opts: { path: { id: string } }): Promise<unknown>;
     };
+    config: {
+        // Returns the server's merged config including the active model string
+        get(): Promise<{ data?: { model?: string } }>;
+        // Returns all known providers and the default modelID per providerID
+        providers(): Promise<{ data?: { providers?: unknown[]; default?: Record<string, string> } }>;
+    };
     event: {
         subscribe(opts?: { signal?: AbortSignal }): Promise<{
             stream: AsyncGenerator<{
-                // Real SDK event union — we only care about message.part.updated
                 type?: string;
                 properties?: {
+                    // session.updated / session.created carry the session in properties
+                    id?: string;
+                    title?: string;
+                    time?: { updated?: number };
+                    // message.part.updated carries the part + delta
                     part?: { type?: string; text?: string; sessionID?: string };
                     delta?: string;
                 };
@@ -52,20 +85,27 @@ export class OpenCodeClient implements vscode.Disposable {
     private sdkClient: SDKClient | null = null;
     private promptAbort: AbortController | null = null;
 
+    // Cached server-default model, resolved once from config.providers()
+    private cachedDefaultModel: { providerID: string; modelID: string } | null = null;
+
+    // Background SSE watcher for live session list updates
+    private bgAbort: AbortController | null = null;
+    public onSessionsChanged?: () => void;
+
     // ── Server discovery ──────────────────────────────────────────────────────
 
     async getClient(): Promise<SDKClient> {
         if (this.sdkClient) return this.sdkClient;
 
         const config = vscode.workspace.getConfiguration("opencode");
-        const explicitUrl = config.get<string>("serverUrl") || "";
+        const explicitUrl = (config.get<string>("serverUrl") || "").replace(/\/$/, "");
         const primaryPort = config.get<number>("port") || 4096;
         const extraPorts = config.get<number[]>("probePorts") || [];
         const cliPath = config.get<string>("cliPath") || "opencode";
 
         const candidates: string[] = [];
         if (explicitUrl) {
-            candidates.push(explicitUrl.replace(/\/$/, ""));
+            candidates.push(explicitUrl);
         } else {
             candidates.push(`http://127.0.0.1:${primaryPort}`);
             for (const p of extraPorts) {
@@ -140,14 +180,200 @@ export class OpenCodeClient implements vscode.Disposable {
         });
     }
 
-    // ── Session ───────────────────────────────────────────────────────────────
+    // ── Session list ──────────────────────────────────────────────────────────
 
-    async createSession(): Promise<string> {
+    async listSessions(): Promise<RemoteSession[]> {
+        const client = await this.getClient();
+        const result = await client.session.list();
+        const raw = result?.data;
+        if (!Array.isArray(raw)) return [];
+        return raw
+            .map((s) => ({
+                id: s.id,
+                title: s.title || "Untitled",
+                updatedAt: s.time?.updated ?? Date.now(),
+            }))
+            .sort((a, b) => b.updatedAt - a.updatedAt);
+    }
+
+    async loadMessages(sessionId: string): Promise<RemoteMessage[]> {
+        const client = await this.getClient();
+        const result = await client.session.messages({ path: { id: sessionId } });
+        const raw = result?.data;
+        if (!Array.isArray(raw)) return [];
+        return raw
+            .map((m) => {
+                const text = m.parts
+                    .filter((p) => p.type === "text" && typeof p.text === "string")
+                    .map((p) => p.text ?? "")
+                    .join("");
+                return {
+                    role: (m.info.role === "user" ? "user" : "assistant") as "user" | "assistant",
+                    text,
+                    timestamp: m.info.time?.created ?? Date.now(),
+                };
+            })
+            .filter((m) => m.text.length > 0);
+    }
+
+    async createSession(): Promise<RemoteSession> {
         const client = await this.getClient();
         const result = await client.session.create({ body: {} });
-        const id = result?.data?.id;
-        if (!id) throw new Error("opencode server did not return a session ID.");
-        return id;
+        const s = result?.data;
+        if (!s?.id) throw new Error("opencode server did not return a session ID.");
+        return {
+            id: s.id,
+            title: s.title || "New Session",
+            updatedAt: s.time?.updated ?? Date.now(),
+        };
+    }
+
+    async deleteSession(sessionId: string): Promise<void> {
+        const client = await this.getClient();
+        await client.session.delete({ path: { id: sessionId } });
+    }
+
+    async renameSession(sessionId: string, title: string): Promise<void> {
+        const client = await this.getClient();
+        await client.session.update({ path: { id: sessionId }, body: { title } });
+    }
+
+    // ── Background SSE watcher (live session list) ────────────────────────────
+
+    async startBackgroundWatch(): Promise<void> {
+        if (this.bgAbort) return; // already watching
+        const abort = new AbortController();
+        this.bgAbort = abort;
+
+        try {
+            const client = await this.getClient();
+            const sub = await client.event.subscribe({ signal: abort.signal });
+            void (async () => {
+                try {
+                    for await (const event of sub.stream) {
+                        if (abort.signal.aborted) break;
+                        const t = event?.type ?? "";
+                        if (
+                            t === "session.updated" ||
+                            t === "session.created" ||
+                            t === "session.deleted"
+                        ) {
+                            this.onSessionsChanged?.();
+                        }
+                    }
+                } catch {
+                    // stream ended or aborted — expected
+                }
+            })();
+        } catch {
+            // background watch is best-effort; server may not be up yet
+        }
+    }
+
+    stopBackgroundWatch(): void {
+        if (this.bgAbort) {
+            this.bgAbort.abort();
+            this.bgAbort = null;
+        }
+    }
+
+    // ── Model resolution ──────────────────────────────────────────────────────
+
+    /**
+     * Returns the { providerID, modelID } to use for a prompt, or undefined to
+     * let the server decide.
+     *
+     * Resolution order:
+     *  1. opencode.model VS Code setting — supports two formats:
+     *       "providerID/modelID"          e.g. "anthropic/claude-sonnet-4-5"
+     *       flat model string             e.g. "eu.anthropic.claude-sonnet-4-6"
+     *     For the flat format we resolve against config.providers() to get the
+     *     correct split without guessing on dot positions.
+     *  2. Server default from config.providers() — whatever opencode.json says.
+     *  3. undefined — server uses its own built-in default.
+     */
+    private async resolveModel(
+        client: SDKClient
+    ): Promise<{ providerID: string; modelID: string } | undefined> {
+        const vscodeSetting = (
+            vscode.workspace.getConfiguration("opencode").get<string>("model") ?? ""
+        ).trim();
+
+        // ── VS Code setting takes priority ──────────────────────────────────────
+        if (vscodeSetting) {
+            // Slash format: "providerID/modelID"
+            const slash = vscodeSetting.indexOf("/");
+            if (slash > 0) {
+                return {
+                    providerID: vscodeSetting.slice(0, slash),
+                    modelID: vscodeSetting.slice(slash + 1),
+                };
+            }
+
+            // Flat format: look it up in the providers map to get the correct split.
+            const split = await this.splitModelId(client, vscodeSetting);
+            if (split) return split;
+        }
+
+        // ── Server default ──────────────────────────────────────────────────────
+        if (this.cachedDefaultModel) return this.cachedDefaultModel;
+
+        try {
+            const result = await client.config.providers();
+            const defaults = result?.data?.default ?? {};
+            // defaults is { [providerID]: modelID }, e.g. { "eu.anthropic": "claude-sonnet-4-6" }
+            const providerIDs = Object.keys(defaults);
+            if (providerIDs.length > 0) {
+                const providerID = providerIDs[0];
+                const modelID = defaults[providerID];
+                this.cachedDefaultModel = { providerID, modelID };
+                return this.cachedDefaultModel;
+            }
+        } catch {
+            // config.providers() unavailable — fall through to omitting model
+        }
+
+        // ── Nothing resolved — let the server decide ────────────────────────────
+        return undefined;
+    }
+
+    /**
+     * Given a flat model string like "eu.anthropic.claude-sonnet-4-6", look it
+     * up in the server's providers list to find the matching { providerID, modelID }.
+     * Falls back to last-dot split if the API call fails.
+     */
+    private async splitModelId(
+        client: SDKClient,
+        flatId: string
+    ): Promise<{ providerID: string; modelID: string } | undefined> {
+        try {
+            const result = await client.config.providers();
+            const providers = (result?.data?.providers ?? []) as Array<{
+                id: string;
+                models?: Array<{ id: string }>;
+            }>;
+            for (const provider of providers) {
+                for (const model of provider.models ?? []) {
+                    // The full model key in opencode.json is "providerID.modelID"
+                    if (`${provider.id}.${model.id}` === flatId || model.id === flatId) {
+                        return { providerID: provider.id, modelID: model.id };
+                    }
+                }
+            }
+        } catch {
+            // providers API unavailable
+        }
+
+        // Last-resort: split on last dot (works for "eu.anthropic.claude-sonnet-4-6")
+        const dot = flatId.lastIndexOf(".");
+        if (dot > 0) {
+            return {
+                providerID: flatId.slice(0, dot),
+                modelID: flatId.slice(dot + 1),
+            };
+        }
+
+        return undefined;
     }
 
     // ── Send + stream ─────────────────────────────────────────────────────────
@@ -192,21 +418,14 @@ export class OpenCodeClient implements vscode.Disposable {
 
         parts.push({ type: "text", text: prompt });
 
-        // Resolve model from settings (format: "providerID/modelID")
-        const config = vscode.workspace.getConfiguration("opencode");
-        const modelSetting = config.get<string>("model") || "";
-        let modelOpt: { providerID: string; modelID: string } | undefined;
-        if (modelSetting) {
-            const slash = modelSetting.indexOf("/");
-            if (slash > 0) {
-                modelOpt = {
-                    providerID: modelSetting.slice(0, slash),
-                    modelID: modelSetting.slice(slash + 1),
-                };
-            }
-        }
+        // Resolve which model to use for this prompt.
+        // Priority:
+        //   1. opencode.model VS Code setting (user explicit override)
+        //   2. Server default from config.providers() (respects opencode.json)
+        //   3. Omit model entirely (server picks its own default)
+        const modelOpt = await this.resolveModel(client);
 
-        // Subscribe to the event stream BEFORE sending the prompt
+        // Subscribe to SSE BEFORE sending the prompt so we don't miss early chunks
         let eventStream: AsyncGenerator<{
             type?: string;
             properties?: {
@@ -224,21 +443,68 @@ export class OpenCodeClient implements vscode.Disposable {
 
         // Consume SSE events in the background
         if (eventStream) {
-            (async () => {
+            void (async () => {
+                // The server emits message.part.updated for BOTH the user message and
+                // the assistant reply. We must skip user parts to avoid echoing the prompt.
+                // Strategy: capture the user messageID from the first message.updated
+                // event with role "user", then skip any parts whose messageID matches it.
+                let userMessageId: string | null = null;
+
+                // For the fallback (no delta field): track chars emitted per part.
+                const emittedLength = new Map<string, number>();
+
                 try {
                     for await (const event of eventStream!) {
                         if (abort.signal.aborted) break;
-                        // The SDK emits events shaped as:
-                        //   { type: "message.part.updated", properties: { part: { sessionID, type, text }, delta } }
-                        // `delta` is the incremental text chunk for streaming text parts.
-                        if (
-                            event?.type === "message.part.updated" &&
-                            event?.properties?.part?.sessionID === sessionId &&
-                            event?.properties?.part?.type === "text"
-                        ) {
-                            // Prefer delta (incremental chunk) over full text to avoid duplication
-                            const chunk = event.properties.delta ?? event.properties.part.text ?? "";
-                            if (chunk) onChunk(chunk);
+
+                        const t = event?.type ?? "";
+                        const props = event?.properties as Record<string, unknown> | undefined;
+
+                        // Track the user message ID so we can exclude its parts below.
+                        if (t === "message.updated") {
+                            const info = props?.info as Record<string, unknown> | undefined;
+                            if (info?.role === "user" && info?.sessionID === sessionId) {
+                                userMessageId = info.id as string;
+                            }
+                        }
+
+                        // Forward server-side model/generation errors to the UI.
+                        if (t === "session.error" && props?.sessionID === sessionId) {
+                            const err = props?.error as Record<string, unknown> | undefined;
+                            const msg = (err?.data as Record<string, unknown>)?.message
+                                ?? err?.name
+                                ?? "Unknown server error";
+                            onError(String(msg));
+                        }
+
+                        if (t === "message.part.updated") {
+                            const part = props?.part as Record<string, unknown> | undefined;
+                            if (
+                                part?.sessionID === sessionId &&
+                                part?.type === "text" &&
+                                // Skip the user message's own parts — those are the echo.
+                                part?.messageID !== userMessageId
+                            ) {
+                                const delta = props?.delta as string | undefined;
+                                const partId = (part?.id as string) ?? "";
+
+                                if (typeof delta === "string" && delta.length > 0) {
+                                    // Server provided an explicit incremental delta — use it directly.
+                                    onChunk(delta);
+                                    if (partId) {
+                                        emittedLength.set(partId, (emittedLength.get(partId) ?? 0) + delta.length);
+                                    }
+                                } else if (typeof part?.text === "string" && part.text.length > 0) {
+                                    // No delta — compute the new slice from full accumulated text.
+                                    const fullText = part.text as string;
+                                    const already = emittedLength.get(partId) ?? 0;
+                                    const newSlice = fullText.slice(already);
+                                    if (newSlice.length > 0) {
+                                        emittedLength.set(partId, fullText.length);
+                                        onChunk(newSlice);
+                                    }
+                                }
+                            }
                         }
                     }
                 } catch {
@@ -266,7 +532,7 @@ export class OpenCodeClient implements vscode.Disposable {
 
     // ── Abort ─────────────────────────────────────────────────────────────────
 
-    abort() {
+    abort(): void {
         if (this.promptAbort) {
             this.promptAbort.abort();
             this.promptAbort = null;
@@ -285,12 +551,14 @@ export class OpenCodeClient implements vscode.Disposable {
 
     // ── Dispose ───────────────────────────────────────────────────────────────
 
-    dispose() {
+    dispose(): void {
         this.abort();
+        this.stopBackgroundWatch();
         if (this.serverProcess) {
             this.serverProcess.kill();
             this.serverProcess = null;
         }
         this.sdkClient = null;
+        this.cachedDefaultModel = null;
     }
 }
